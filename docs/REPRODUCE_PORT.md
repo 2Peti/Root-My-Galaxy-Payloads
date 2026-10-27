@@ -1,16 +1,21 @@
 # Reproduce the S928B port
 
-The only supported target is `e3q-S928BXXS6DZF2`:
+The repository supports two SM-S928B firmware profiles. Build the original
+DZF2 exploit with:
 
 ```sh
 make TARGET=e3q-S928BXXS6DZF2 ANDROID_NDK_HOME=/path/to/android-ndk stable
 ```
 
-The generated `build/e3q-S928BXXS6DZF2/` directory is temporary. Compare the
-release payload to the artifact hash in `docs/SM-S928B-S928BXXS6DZF2.md`, then
-remove `build/` before publishing source changes.
+For U5DZDP, build the same device-tested S928B offsets under its exact identity:
 
-KernelSU uses v3.2.5 and the patch stack documented in
-[`kernelsu/README.md`](../kernelsu/README.md). Build the module against the
-exact S928B release and run the DDK `check_symbol` step before publishing a
-replacement.
+```sh
+make TARGET=e3q-S928BXXU5DZDP ANDROID_NDK_HOME=/path/to/android-ndk release
+```
+
+Generated `build/` directories are temporary. Compare each output to the
+corresponding artifact record before publishing source changes.
+
+The original KernelSU v3.2.5 patch stack is documented in
+[`kernelsu/README.md`](../kernelsu/README.md). The additional KernelSU Next
+build and its DDK limits are in [`kernelsu-next/README.md`](../kernelsu-next/README.md).
