@@ -1,0 +1,1233 @@
+From 80a3ab31eb108a5515ecaea0f4799a035b7d1ce1 Mon Sep 17 00:00:00 2001
+From: JingMatrix <jingmatrix@gmail.com>
+Date: Tue, 18 Aug 2026 20:53:56 +0200
+Subject: [PATCH] Implement mount view hiding for isolated processes
+
+Isolated and app-zygote processes can read peer and self mount tables
+(AID_READPROC + hidepid bypass), and Android 17 zygote_next native children
+read their own mountinfo from init's global namespace. Both expose module
+mounts, which unmount-based hiding cannot cover in a shared namespace.
+
+Filter the per-record show() output of /proc/<pid>/{mountinfo,mounts,
+mountstats}, keyed on the reading task, by patching the .open slot of the
+three proc file_operations to swap in a filtering show. A record is hidden
+when its rendered text carries a module marker, when it matches the umount
+list, or when the mount's real root dentry path lives under /data/adb; the
+last covers /proc/mounts and mountstats, whose format omits the root field.
+Filtering (not unmounting) is safe in the global namespace and keeps every
+view of a given reader consistent, so the differential probe cannot fire.
+
+The hide predicate is independent of ksu_module_mounted (modules may be
+mounted outside KernelSU, e.g. NeoZygisk) and covers the app-zygote isolated
+uid range (90000-98999) as well as the regular one. Exposed as a
+manager-toggleable feature (KSU_FEATURE_MOUNT_HIDE); the kernel_umount path
+is kept for classic private-namespace apps. Samsung no-patch-text builds use
+kretprobe return handlers on proc mount-file opens and update only the
+per-file show callback, avoiding global file_operations writes.
+---
+ kernel/Kbuild                                 |   1 +
+ kernel/feature/mount_hide.c                   | 758 ++++++++++++++++++++
+ kernel/feature/mount_hide.h                   |   7 +
+ kernel/hook/setuid_hook.c                     |   3 +
+ kernel/policy/allowlist.h                     |   8 +-
+ manager/app/src/main/cpp/jni.cc               |  12 +
+ manager/app/src/main/cpp/ksu.cc               |  19 +
+ manager/app/src/main/cpp/ksu.h                |   5 +
+ .../main/java/me/weishu/kernelsu/Natives.kt   |   3 +
+ .../data/repository/SettingsRepository.kt     |   4 +
+ .../data/repository/SettingsRepositoryImpl.kt |   6 +
+ .../ui/screen/settings/SettingsMaterial.kt    |  15 +
+ .../ui/screen/settings/SettingsMiuix.kt       |  21 +
+ .../ui/screen/settings/SettingsScreen.kt      |   1 +
+ .../ui/screen/settings/SettingsUiState.kt     |   3 +
+ .../ui/viewmodel/SettingsViewModel.kt         |  27 +
+ manager/app/src/main/res/values/strings.xml   |   4 +
+ uapi/feature.h                                |   1 +
+ userspace/ksud/src/cli.rs                     |   4 +-
+ userspace/ksud/src/feature.rs                 |   7 +
+ 20 files changed, 906 insertions(+), 3 deletions(-)
+ create mode 100644 kernel/feature/mount_hide.c
+ create mode 100644 kernel/feature/mount_hide.h
+
+diff --git a/kernel/Kbuild b/kernel/Kbuild
+index cdc4828c7033..aa49b55c3ccb 100644
+--- a/kernel/Kbuild
++++ b/kernel/Kbuild
+@@ -6,3 +6,4 @@
+ kernelsu-objs += feature/kernel_umount.o
++kernelsu-objs += feature/mount_hide.o
+ kernelsu-objs += feature/sulog.o
+ kernelsu-objs += feature/sucompat.o
+diff --git a/kernel/feature/mount_hide.c b/kernel/feature/mount_hide.c
+new file mode 100644
+index 0000000..535edff
+--- /dev/null
++++ b/kernel/feature/mount_hide.c
+@@ -0,0 +1,758 @@
++#include <linux/version.h>
++#include <linux/compiler.h>
++#include <linux/cred.h>
++#include <linux/dcache.h>
++#include <linux/err.h>
++#include <linux/fs.h>
++#include <linux/gfp.h>
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/kprobes.h>
++#include <linux/list.h>
++#include <linux/mm.h>
++#include <linux/mount.h>
++#include <linux/mutex.h>
++#include <linux/path.h>
++#include <linux/printk.h>
++#include <linux/ptrace.h>
++#include <linux/rcupdate.h>
++#include <linux/rwsem.h>
++#include <linux/seq_file.h>
++#include <linux/string.h>
++#include <linux/types.h>
++
++#include "feature/mount_hide.h"
++#include "feature/kernel_umount.h"
++#include "infra/symbol_resolver.h"
++#include "hook/patch_memory.h"
++#include "policy/allowlist.h"
++#include "policy/feature.h"
++#include "runtime/ksud_boot.h"
++#include "klog.h" // IWYU pragma: keep
++
++/*
++ * Mount-view hiding.
++ *
++ * Two mount-based root probes are defeated here:
++ *   1. A classic isolated process that inherits AID_READPROC (gid 3009) and reads
++ *      every process's /proc/<pid>/{mountinfo,mounts,mountstats} - it flags module
++ *      marker substrings AND a differential (distinct mount views vs propagation
++ *      classes).
++ *   2. An Android 17 zygote_next native isolated process that reads its OWN
++ *      /proc/self/mountinfo but from init's GLOBAL namespace, where the module
++ *      mounts are still present.
++ *
++ * We do NOT strip AID_READPROC, do NOT unmount in a shared namespace, and do NOT
++ * spoof the Groups line - any of those is itself a non-stock deviation. Instead we
++ * filter the per-record 'show' output of the three mount files, keyed on the READER
++ * (current), applied uniformly to its own file and every pid it reads. Because the
++ * same set of records is removed from every view, views never diverge and the
++ * differential probe cannot fire; because it works by filtering (not unmounting) it
++ * is safe in the global namespace too. procfs reports st_size == 0 for these files,
++ * so removing records leaves no size tell.
++ *
++ * The kernel-side umount path (feature/kernel_umount.c) is kept as-is for classic
++ * private-namespace apps; this filter is complementary.
++ *
++ * HIDE DECISION - three complementary matchers.
++ * ---------------------------------------------------------
++ * Both probes parse the WHOLE rendered mountinfo line and match markers anywhere in
++ * it - crucially in the mount-root field (field 4, e.g. "/adb/modules/...") and in
++ * the super-/mount-options (overlay "lowerdir=/data/adb/..."), not just the
++ * mountpoint. So the primary matcher lets the ORIGINAL show function render the record
++ * into the seq_file buffer, then scans exactly those bytes; on a marker hit we rewind
++ * m->count to erase the record. This mirrors the probes byte-for-byte on the mountinfo
++ * format.
++ *
++ * The text scan alone is NOT enough for /proc/pid/mounts and mountstats: those formats
++ * omit the mount-root field, so a module bind mount (e.g. bindhosts binding
++ * /adb/modules/.../system/etc/hosts onto /system/etc/hosts) renders with only a
++ * block-device source and no visible marker. Two format-independent backstops cover it:
++ *   (a) a match of the record text against the registered umount list
++ *       (feature/kernel_umount.h) - the mountpoint appears in every format; note this
++ *       list is empty when kernel_umount is disabled, so it cannot be relied on alone;
++ *   (b) inspection of the mount's real root dentry path (ksu_mnt_root_hidden), which
++ *       reveals /adb/modules/... regardless of the printed format and needs no umount
++ *       list. It allocates a page and computes a dentry path, but only for a non-fs-root
++ *       mount (IS_ROOT short-circuits the common whole-filesystem case).
++ * To avoid over-hiding stock submounts, coarse/stock ancestors are never used for the
++ * umount-list match (see ksu_region_has_mount_list()).
++ */
++
++/*
++ * View of the kernel's `struct proc_mounts` (fs/mount.h, private header).
++ *
++ * Only the first three members - ns, root, show - are touched here, and their
++ * order/type is ABI-stable across every GKI version this fork targets
++ * (5.10 / 5.15 / 6.1 / 6.6 / 6.12). We never allocate one of these, never index
++ * past ->show, and only ever dereference ->show on a kernel-allocated object.
++ *
++ * The `struct mount cursor;` tail was added in commit 9f6c61f96f2d (v5.8-rc1), so
++ * ALL supported targets (>=5.8) carry the cursor layout; the older
++ * `void *cached_mount; u64 cached_event; loff_t cached_index;` tail existed only
++ * before 5.8, which this fork does not target. Either way the head (ns/root/show)
++ * is identical and the tail is never accessed, so we deliberately omit it - it
++ * embeds `struct mount` by value, whose layout is __randomize_layout and whose
++ * header (fs/mount.h) is kernel-private.
++ */
++struct ksu_proc_mounts {
++    struct mnt_namespace *ns;
++    struct path root;
++    int (*show)(struct seq_file *, struct vfsmount *);
++    /* kernel-private tail intentionally omitted - see comment above */
++};
++
++#ifndef CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT
++typedef int (*ksu_proc_open_fn)(struct inode *, struct file *);
++#endif
++typedef int (*ksu_show_fn)(struct seq_file *, struct vfsmount *);
++
++static DEFINE_MUTEX(ksu_mount_hide_mutex);
++static bool ksu_mount_hide_enabled __read_mostly = true;
++static bool ksu_mount_hide_running __read_mostly = false;
++
++#ifdef CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT
++struct ksu_mount_hide_probe_data {
++    struct file *file;
++};
++
++static struct file_operations *ksu_mount_hide_ops[3];
++static struct kretprobe ksu_mount_hide_probes[3];
++static unsigned int ksu_mount_hide_probe_count;
++#else
++/* patched .open slots inside the resolved const file_operations (rodata) */
++static ksu_proc_open_fn *ksu_mounts_open_slot;
++static ksu_proc_open_fn *ksu_mountinfo_open_slot;
++static ksu_proc_open_fn *ksu_mountstats_open_slot;
++
++/* saved originals (called through raw pointers -> callers are __nocfi) */
++static ksu_proc_open_fn ksu_orig_mounts_open;
++static ksu_proc_open_fn ksu_orig_mountinfo_open;
++static ksu_proc_open_fn ksu_orig_mountstats_open;
++#endif
++static ksu_show_fn ksu_orig_show_vfsmnt;
++static ksu_show_fn ksu_orig_show_mountinfo;
++static ksu_show_fn ksu_orig_show_vfsstat;
++
++/*
++ * High-confidence markers - substrings that only appear in a rendered mount record
++ * because of a root solution, never on a stock device. Matched case-insensitively
++ * to mirror both probes (ZygoteNextProbe uses contains_ignore_case; Privisolated's
++ * "/adb/" / "magisk" checks land here too). "/adb/" is the fs-relative form seen in
++ * the mount-root field and overlay lowerdir; "/data/adb" additionally covers a bare
++ * "/data/adb" mountpoint (no trailing slash).
++ */
++static const char *const ksu_mount_markers[] = {
++    "/adb/", "/data/adb", "kernelsu", "magisk", "zygisk", "/debug_ramdisk",
++};
++
++/*
++ * Stock ancestors that must NEVER drive a mount_list subtree match: a coarse umount
++ * entry (ksud may register these for the recursive-detach path) would otherwise
++ * over-hide genuine stock submounts, and removing a stock mount is as detectable as
++ * leaving a module one (it can collapse two propagation-class views into one and
++ * fire Privisolated's set.size() != popcount differential).
++ */
++static const char *const ksu_stock_ancestors[] = {
++    "/",    "/system", "/system_ext", "/vendor", "/product",  "/odm",   "/data",        "/mnt",         "/storage",
++    "/dev", "/proc",   "/sys",        "/apex",   "/metadata", "/cache", "/system_dlkm", "/vendor_dlkm", "/odm_dlkm",
++};
++
++/* case-insensitive substring search over a non-NUL-terminated region */
++static bool ksu_region_contains(const char *hay, size_t hlen, const char *needle, size_t nlen)
++{
++    size_t i, j;
++
++    if (!nlen)
++        return true;
++    if (!hay || nlen > hlen)
++        return false;
++    for (i = 0; i + nlen <= hlen; i++) {
++        for (j = 0; j < nlen; j++) {
++            char a = hay[i + j];
++            char b = needle[j];
++
++            if (a >= 'A' && a <= 'Z')
++                a += 'a' - 'A';
++            if (b >= 'A' && b <= 'Z')
++                b += 'a' - 'A';
++            if (a != b)
++                break;
++        }
++        if (j == nlen)
++            return true;
++    }
++    return false;
++}
++
++static bool ksu_region_has_marker(const char *buf, size_t len)
++{
++    size_t i;
++
++    for (i = 0; i < ARRAY_SIZE(ksu_mount_markers); i++) {
++        if (ksu_region_contains(buf, len, ksu_mount_markers[i], strlen(ksu_mount_markers[i])))
++            return true;
++    }
++    return false;
++}
++
++static bool ksu_path_is_stock_ancestor(const char *s)
++{
++    size_t i;
++
++    for (i = 0; i < ARRAY_SIZE(ksu_stock_ancestors); i++) {
++        if (!strcmp(s, ksu_stock_ancestors[i]))
++            return true;
++    }
++    return false;
++}
++
++/* number of non-empty '/'-separated components ("/system/app/foo" -> 3) */
++static int ksu_path_depth(const char *s)
++{
++    int d = 0;
++
++    if (!s)
++        return 0;
++    while (*s) {
++        while (*s == '/')
++            s++;
++        if (!*s)
++            break;
++        d++;
++        while (*s && *s != '/')
++            s++;
++    }
++    return d;
++}
++
++/*
++ * Backstop match against the registered umount list. The mountpoint path appears in
++ * every one of the three formats (mounts/mountinfo/mountstats), so a substring hit
++ * here hides the record consistently across all of them.
++ *
++ * Guards against over-hiding (see ksu_stock_ancestors above):
++ *   - never match on a stock ancestor entry;
++ *   - require at least two path components, so a coarse top-level entry cannot
++ *     swallow stock submounts (deep module mountpoints are unique enough that a
++ *     substring hit is unambiguous).
++ *
++ * Lock order: this runs inside the seq ->show callback, which the mounts iterator
++ * invokes with namespace_sem held for read (m_start). The umount path takes
++ * mount_list_lock(R) -> namespace_sem(W); taking mount_list_lock(R) here under
++ * namespace_sem(R) would invert that and, with a queued mount_list_lock writer,
++ * deadlock. We therefore use down_read_trylock and simply skip the backstop on
++ * contention (the intrinsic marker scan still applies) - correctness of the hide
++ * never depends on winning a racing writer.
++ */
++static bool ksu_region_has_mount_list(const char *buf, size_t len)
++{
++    struct mount_entry *entry;
++    bool hidden = false;
++
++    if (!down_read_trylock(&mount_list_lock))
++        return false;
++
++    list_for_each_entry (entry, &mount_list, list) {
++        const char *e = entry->umountable;
++        size_t elen;
++
++        if (!e)
++            continue;
++        if (ksu_path_is_stock_ancestor(e))
++            continue;
++        if (ksu_path_depth(e) < 2)
++            continue;
++        elen = strlen(e);
++        if (elen && ksu_region_contains(buf, len, e, elen)) {
++            hidden = true;
++            break;
++        }
++    }
++    up_read(&mount_list_lock);
++    return hidden;
++}
++
++/*
++ * Format-independent module check: look at the mount's real root DENTRY path rather
++ * than the rendered text. A module is a bind mount whose source subtree lives under
++ * /data/adb (shown as /adb/... relative to the data superblock), e.g. bindhosts binds
++ * /adb/modules/bindhosts/system/etc/hosts onto /system/etc/hosts. Only /proc/pid/
++ * mountinfo prints that root field; /proc/pid/mounts and mountstats do not, so a
++ * text scan misses such records there. Inspecting mnt_root catches them everywhere
++ * and needs no populated umount list (which is empty when kernel_umount is off).
++ *
++ * A whole-filesystem mount has mnt_root == the fs root (IS_ROOT), never a module
++ * bind, so we skip the path computation for those - the common case.
++ */
++static bool ksu_mnt_root_hidden(struct vfsmount *mnt)
++{
++    char *buf, *p;
++    bool hit = false;
++
++    if (!mnt || !mnt->mnt_root || IS_ROOT(mnt->mnt_root))
++        return false;
++
++    buf = (char *)__get_free_page(GFP_KERNEL);
++    if (!buf)
++        return false;
++
++    p = dentry_path_raw(mnt->mnt_root, buf, PAGE_SIZE);
++    if (!IS_ERR(p))
++        hit = ksu_region_has_marker(p, strlen(p));
++
++    free_page((unsigned long)buf);
++    return hit;
++}
++
++/*
++ * Decide whether the CURRENT task's mount views should be filtered at all. This is
++ * evaluated once, at open() time, so the reader identity is fixed for the file.
++ *
++ * Predicate (per design):
++ *   (is_appuid || is_isolated) && (is_isolated || ksu_uid_should_umount)
++ *
++ * ksu_uid_should_umount already excludes the manager, su-granted apps and the
++ * webview zygote, so those keep the real view. Isolated processes are always
++ * filtered (they can never legitimately need the module view, and this is what
++ * defeats the zygote_next global-namespace probe). We intentionally do NOT require
++ * is_zygote() here (unlike the umount path): the zygote_next probe reads from the
++ * global namespace and is not necessarily zygote-descended in that sense.
++ */
++#define KSU_APP_ZYGOTE_ISOLATED_FIRST 90000
++
++/*
++ * "Isolated" for the hide predicate covers BOTH ranges an isolated process can land
++ * in: the app-zygote isolated range [90000, 98999] and the regular isolated range
++ * [99000, 99999]. The shared is_isolated_process() only knows the latter; an
++ * app-zygote isolated spawn would otherwise read an unfiltered view.
++ */
++static bool ksu_is_isolated_for_hide(uid_t uid)
++{
++    uid_t appid = uid % PER_USER_RANGE;
++
++    return appid >= KSU_APP_ZYGOTE_ISOLATED_FIRST && appid <= LAST_ISOLATED_UID;
++}
++
++static bool ksu_should_hide_mount_for_current(void)
++{
++    uid_t uid;
++    bool isolated;
++
++    /*
++     * Intentionally independent of ksu_module_mounted: module mounts may be
++     * established outside KernelSU's own path (e.g. NeoZygisk), so that flag does
++     * not reflect whether an isolated view contains module records. The filter only
++     * ever removes lines that match a marker or the umount list, so running it for
++     * every hide target is safe (no module mounts => nothing removed).
++     */
++    if (!ksu_mount_hide_enabled)
++        return false;
++
++    uid = current_uid().val;
++    isolated = ksu_is_isolated_for_hide(uid);
++    if (!is_appuid(uid) && !isolated)
++        return false;
++    if (!isolated && !ksu_uid_should_umount(uid))
++        return false;
++
++    return true;
++}
++
++/*
++ * Core filter. Let the original show render the record into the seq buffer, then scan
++ * those bytes AND inspect the mount's real root dentry path; on a match from either, we
++ * rewind m->count so the record leaves zero output (the seq iterator simply skips a
++ * zero-length element). The dentry-path check is what catches module bind mounts in
++ * /proc/pid/mounts and mountstats, whose text carries no marker.
++ *
++ * On overflow the record did not fully fit; the seq layer restores the pre-record
++ * offset, doubles the buffer and re-invokes ->show, so we pass through untouched and
++ * do the scan on the full retry. On a nonzero return (SEQ_SKIP / error) the seq layer
++ * discards the bytes itself, so we pass the code through unchanged.
++ *
++ * Called through the seq iterator's function pointer and calling the original through
++ * a raw pointer -> __nocfi.
++ */
++static int __nocfi ksu_filter_show(struct seq_file *m, struct vfsmount *mnt, ksu_show_fn orig)
++{
++    size_t start;
++    int ret;
++
++    if (!m)
++        return orig(m, mnt);
++
++    start = m->count;
++    ret = orig(m, mnt);
++    if (ret)
++        return ret; /* SEQ_SKIP / error: seq layer handles the bytes */
++    if (seq_has_overflowed(m))
++        return 0; /* record truncated; seq will realloc and retry */
++    if (m->count <= start)
++        return 0; /* nothing emitted */
++
++    if (ksu_region_has_marker(m->buf + start, m->count - start) ||
++        ksu_region_has_mount_list(m->buf + start, m->count - start) || ksu_mnt_root_hidden(mnt))
++        m->count = start; /* erase the record */
++
++    return 0;
++}
++
++static int __nocfi ksu_show_vfsmnt(struct seq_file *m, struct vfsmount *mnt)
++{
++    return ksu_filter_show(m, mnt, ksu_orig_show_vfsmnt);
++}
++
++static int __nocfi ksu_show_mountinfo(struct seq_file *m, struct vfsmount *mnt)
++{
++    return ksu_filter_show(m, mnt, ksu_orig_show_mountinfo);
++}
++
++static int __nocfi ksu_show_vfsstat(struct seq_file *m, struct vfsmount *mnt)
++{
++    return ksu_filter_show(m, mnt, ksu_orig_show_vfsstat);
++}
++
++/*
++ * .open shims. Each calls the saved original open (which populates the seq_file and
++ * proc_mounts, setting proc_mounts::show to the kernel original), then - if the
++ * reader is a hide target - swaps proc_mounts::show to the matching filter. That
++ * swap is a plain store to the per-file, kmalloc'd proc_mounts (NOT rodata), so no
++ * text patching is involved here.
++ *
++ * Called through the rodata file_operations table and calling the original through a
++ * raw pointer -> __nocfi.
++ */
++static int __nocfi ksu_install_filter(struct file *file, ksu_show_fn filter)
++{
++    struct seq_file *m = file->private_data;
++    struct ksu_proc_mounts *p;
++
++    if (!m || !m->private)
++        return 0;
++    p = (struct ksu_proc_mounts *)m->private;
++    p->show = filter;
++    return 0;
++}
++
++#ifdef CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT
++#ifdef CONFIG_KRETPROBES
++static int ksu_mount_hide_probe_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
++{
++    struct ksu_mount_hide_probe_data *data = (struct ksu_mount_hide_probe_data *)ri->data;
++
++    if (!ksu_should_hide_mount_for_current())
++        return 1;
++#ifdef CONFIG_ARM64
++    data->file = (struct file *)(unsigned long)regs->regs[1];
++    return data->file ? 0 : 1;
++#else
++    return 1;
++#endif
++}
++
++static int ksu_mount_hide_probe_return(struct kretprobe_instance *ri, struct pt_regs *regs)
++{
++    struct ksu_mount_hide_probe_data *data = (struct ksu_mount_hide_probe_data *)ri->data;
++    struct file *file = data->file;
++    ksu_show_fn filter = NULL;
++
++    if (regs_return_value(regs) || !file)
++        return 0;
++    if (file->f_op == ksu_mount_hide_ops[0])
++        filter = ksu_show_vfsmnt;
++    else if (file->f_op == ksu_mount_hide_ops[1])
++        filter = ksu_show_mountinfo;
++    else if (file->f_op == ksu_mount_hide_ops[2])
++        filter = ksu_show_vfsstat;
++    if (filter)
++        ksu_install_filter(file, filter);
++    return 0;
++}
++
++static void ksu_mount_hide_unregister_probes(void)
++{
++    while (ksu_mount_hide_probe_count)
++        unregister_kretprobe(&ksu_mount_hide_probes[--ksu_mount_hide_probe_count]);
++}
++
++static int ksu_mount_hide_register_probes(void)
++{
++    unsigned int i, j;
++    int ret;
++
++    for (i = 0; i < ARRAY_SIZE(ksu_mount_hide_ops); i++) {
++        struct kretprobe *probe;
++        bool duplicate = false;
++
++        if (!ksu_mount_hide_ops[i] || !ksu_mount_hide_ops[i]->open) {
++            ret = -ENOSYS;
++            goto fail;
++        }
++        for (j = 0; j < i; j++) {
++            if (ksu_mount_hide_ops[j]->open == ksu_mount_hide_ops[i]->open) {
++                duplicate = true;
++                break;
++            }
++        }
++        if (duplicate)
++            continue;
++
++        probe = &ksu_mount_hide_probes[ksu_mount_hide_probe_count];
++        memset(probe, 0, sizeof(*probe));
++        probe->kp.addr = (kprobe_opcode_t *)(unsigned long)ksu_mount_hide_ops[i]->open;
++        probe->entry_handler = ksu_mount_hide_probe_entry;
++        probe->handler = ksu_mount_hide_probe_return;
++        probe->data_size = sizeof(struct ksu_mount_hide_probe_data);
++        probe->maxactive = 64;
++        ret = register_kretprobe(probe);
++        if (ret) {
++            pr_err("mount_hide: kretprobe registration failed for file %u: %d\n", i, ret);
++            goto fail;
++        }
++        ksu_mount_hide_probe_count++;
++    }
++    pr_info("mount_hide: registered %u no-patch-text open probes\n", ksu_mount_hide_probe_count);
++    return 0;
++
++fail:
++    ksu_mount_hide_unregister_probes();
++    return ret;
++}
++#endif /* CONFIG_KRETPROBES */
++#else
++static int __nocfi ksu_mounts_open(struct inode *inode, struct file *file)
++{
++    int ret = ksu_orig_mounts_open(inode, file);
++    if (!ret && ksu_should_hide_mount_for_current())
++        ksu_install_filter(file, ksu_show_vfsmnt);
++    return ret;
++}
++
++static int __nocfi ksu_mountinfo_open(struct inode *inode, struct file *file)
++{
++    int ret = ksu_orig_mountinfo_open(inode, file);
++    if (!ret && ksu_should_hide_mount_for_current())
++        ksu_install_filter(file, ksu_show_mountinfo);
++    return ret;
++}
++
++static int __nocfi ksu_mountstats_open(struct inode *inode, struct file *file)
++{
++    int ret = ksu_orig_mountstats_open(inode, file);
++    if (!ret && ksu_should_hide_mount_for_current())
++        ksu_install_filter(file, ksu_show_vfsstat);
++    return ret;
++}
++
++/* patch one file_operations::open; record slot + original for teardown */
++static int ksu_patch_open(struct file_operations *ops, ksu_proc_open_fn newfn, ksu_proc_open_fn **slot_out,
++                          ksu_proc_open_fn *orig_out, const char *name)
++{
++    ksu_proc_open_fn *slot = &ops->open;
++    ksu_proc_open_fn nf = newfn;
++    int ret;
++
++    *orig_out = *slot;
++    pr_info("mount_hide: %s.open: 0x%lx [%pSb]\n", name, (unsigned long)*slot, *slot);
++    ret = ksu_patch_text(slot, &nf, sizeof(nf), KSU_PATCH_TEXT_FLUSH_DCACHE);
++    if (ret) {
++        pr_err("mount_hide: patch_text %s.open err: %d\n", name, ret);
++        *orig_out = NULL;
++        return ret;
++    }
++    *slot_out = slot;
++    return 0;
++}
++
++static void ksu_unhook_one(ksu_proc_open_fn **slot, ksu_proc_open_fn *orig, const char *name)
++{
++    int ret;
++
++    if (!*slot || !*orig)
++        return;
++    ret = ksu_patch_text(*slot, orig, sizeof(*orig), KSU_PATCH_TEXT_FLUSH_DCACHE);
++    if (ret)
++        pr_err("mount_hide: exit: patch_text %s err: %d\n", name, ret);
++    *slot = NULL;
++    /*
++     * Deliberately keep *orig non-NULL: a shim already past the .open restore, or a
++     * seq_file already opened while hooked (its proc_mounts::show still points at our
++     * filter, which calls *orig), may still dereference it. The unhook path issues a
++     * synchronize_rcu() after restoring all three slots to drain such in-flight shims
++     * before teardown proceeds, so leaving *orig valid until then is safe; NULLing it
++     * would instead hand an in-flight shim a NULL call.
++    */
++}
++#endif /* CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT */
++
++static void ksu_mount_hide_unhook(void)
++{
++#ifdef CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT
++#ifdef CONFIG_KRETPROBES
++    ksu_mount_hide_unregister_probes();
++#endif
++#else
++    ksu_unhook_one(&ksu_mounts_open_slot, &ksu_orig_mounts_open, "proc_mounts_operations");
++    ksu_unhook_one(&ksu_mountinfo_open_slot, &ksu_orig_mountinfo_open, "proc_mountinfo_operations");
++    ksu_unhook_one(&ksu_mountstats_open_slot, &ksu_orig_mountstats_open, "proc_mountstats_operations");
++#endif
++    /* drain shims that already entered .open before the restore above */
++#ifndef CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT
++    synchronize_rcu();
++#endif
++}
++
++/*
++ * Resolve every symbol and hook all three files ATOMICALLY, or none.
++ *
++ * If only some files were hooked, /proc/pid/mounts, mountinfo and mountstats would
++ * disagree for a hide target - a trivial cross-file differential that no stock system
++ * exhibits. So a single unresolved symbol (any show fn or any ops struct) makes the
++ * whole feature no-op rather than hooking a subset.
++ *
++ * The static show_* functions and proc_*_operations structs depend on
++ * CONFIG_KALLSYMS_ALL. On no-patch-text Samsung targets, kretprobes observe each
++ * proc file's .open return and replace only the per-file proc_mounts::show pointer;
++ * this avoids modifying the global file_operations table.
++ */
++static int ksu_mount_hide_enable(void)
++{
++    struct file_operations *ops_mounts, *ops_mountinfo, *ops_mountstats;
++    int ret;
++
++    pr_info("mount_hide: init mount hide\n");
++
++    ksu_orig_show_vfsmnt = (ksu_show_fn)find_kernel_symbol_exact("show_vfsmnt");
++    ksu_orig_show_mountinfo = (ksu_show_fn)find_kernel_symbol_exact("show_mountinfo");
++    /* NOTE: the mountstats show symbol is show_vfsstat, NOT show_mountstats */
++    ksu_orig_show_vfsstat = (ksu_show_fn)find_kernel_symbol_exact("show_vfsstat");
++    if (!ksu_orig_show_vfsmnt || !ksu_orig_show_mountinfo || !ksu_orig_show_vfsstat) {
++        pr_err("mount_hide: show fns unresolved (vfsmnt=%d mountinfo=%d vfsstat=%d), refusing partial hook\n",
++               !!ksu_orig_show_vfsmnt, !!ksu_orig_show_mountinfo, !!ksu_orig_show_vfsstat);
++        return -ENOSYS;
++    }
++
++    ops_mounts = (struct file_operations *)find_kernel_symbol_exact("proc_mounts_operations");
++    ops_mountinfo = (struct file_operations *)find_kernel_symbol_exact("proc_mountinfo_operations");
++    ops_mountstats = (struct file_operations *)find_kernel_symbol_exact("proc_mountstats_operations");
++    if (!ops_mounts || !ops_mountinfo || !ops_mountstats) {
++        pr_err("mount_hide: ops unresolved (mounts=%d mountinfo=%d mountstats=%d), refusing partial hook\n",
++               !!ops_mounts, !!ops_mountinfo, !!ops_mountstats);
++        return -ENOSYS;
++    }
++
++#ifdef CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT
++#if defined(CONFIG_KRETPROBES) && defined(CONFIG_ARM64)
++    ksu_mount_hide_ops[0] = ops_mounts;
++    ksu_mount_hide_ops[1] = ops_mountinfo;
++    ksu_mount_hide_ops[2] = ops_mountstats;
++    ret = ksu_mount_hide_register_probes();
++    if (ret)
++        return ret;
++    return 0;
++#else
++    pr_err("mount_hide: no-patch-text fallback requires ARM64 kretprobes\n");
++    return -EOPNOTSUPP;
++#endif
++#else
++    ret = ksu_patch_open(ops_mounts, ksu_mounts_open, &ksu_mounts_open_slot, &ksu_orig_mounts_open,
++                         "proc_mounts_operations");
++    if (ret)
++        goto fail;
++    ret = ksu_patch_open(ops_mountinfo, ksu_mountinfo_open, &ksu_mountinfo_open_slot, &ksu_orig_mountinfo_open,
++                         "proc_mountinfo_operations");
++    if (ret)
++        goto fail;
++    ret = ksu_patch_open(ops_mountstats, ksu_mountstats_open, &ksu_mountstats_open_slot, &ksu_orig_mountstats_open,
++                         "proc_mountstats_operations");
++    if (ret)
++        goto fail;
++
++    pr_info("mount_hide: enabled (3/3 files hooked)\n");
++    return 0;
++
++fail:
++    /* roll back any slot already patched so the three files stay consistent */
++    ksu_mount_hide_unhook();
++    return ret;
++#endif
++}
++
++static void ksu_mount_hide_disable(void)
++{
++    pr_info("mount_hide: exit mount hide\n");
++    ksu_mount_hide_unhook();
++}
++
++static int mount_hide_feature_get(u64 *value)
++{
++    *value = ksu_mount_hide_enabled ? 1 : 0;
++    return 0;
++}
++
++static int mount_hide_feature_set(u64 value)
++{
++    bool enable = value != 0;
++    int ret = 0;
++
++    pr_info("mount_hide: set to %d\n", enable);
++    mutex_lock(&ksu_mount_hide_mutex);
++    if (enable) {
++        if (!ksu_mount_hide_running) {
++            ret = ksu_mount_hide_enable();
++            if (!ret)
++                ksu_mount_hide_running = true;
++        }
++        ksu_mount_hide_enabled = ret == 0;
++    } else {
++        ksu_mount_hide_enabled = false;
++        /*
++         * Leave the .open hooks installed; ksu_should_hide_mount_for_current()
++         * already gates on ksu_mount_hide_enabled, so a disabled toggle makes every
++         * open a pure pass-through. This keeps the toggle cheap and avoids repeated
++         * rodata patching. The hooks are only torn down at module exit.
++         */
++    }
++    mutex_unlock(&ksu_mount_hide_mutex);
++    return ret;
++}
++
++static const struct ksu_feature_handler mount_hide_handler = {
++    .feature_id = KSU_FEATURE_MOUNT_HIDE,
++    .name = "mount_hide",
++    .get_handler = mount_hide_feature_get,
++    .set_handler = mount_hide_feature_set,
++};
++
++void __init ksu_mount_hide_init(void)
++{
++    int ret;
++
++    if (ksu_register_feature_handler(&mount_hide_handler))
++        pr_err("Failed to register mount_hide feature handler\n");
++
++    /* default enabled: install the hooks up front */
++    mutex_lock(&ksu_mount_hide_mutex);
++    if (ksu_mount_hide_enabled && !ksu_mount_hide_running) {
++        ret = ksu_mount_hide_enable();
++        if (!ret)
++            ksu_mount_hide_running = true;
++        else {
++            ksu_mount_hide_enabled = false;
++            pr_err("mount_hide: initialization failed: %d\n", ret);
++        }
++    }
++    mutex_unlock(&ksu_mount_hide_mutex);
++}
++
++void __exit ksu_mount_hide_exit(void)
++{
++    mutex_lock(&ksu_mount_hide_mutex);
++    if (ksu_mount_hide_running) {
++        ksu_mount_hide_disable();
++        ksu_mount_hide_running = false;
++    }
++    mutex_unlock(&ksu_mount_hide_mutex);
++    ksu_unregister_feature_handler(KSU_FEATURE_MOUNT_HIDE);
++}
+diff --git a/kernel/feature/mount_hide.h b/kernel/feature/mount_hide.h
+new file mode 100644
+index 000000000000..0ff6d2acc543
+--- /dev/null
++++ b/kernel/feature/mount_hide.h
+@@ -0,0 +1,7 @@
++#ifndef __KSU_H_MOUNT_HIDE
++#define __KSU_H_MOUNT_HIDE
++
++void ksu_mount_hide_init(void);
++void ksu_mount_hide_exit(void);
++
++#endif // __KSU_H_MOUNT_HIDE
+diff --git a/kernel/hook/setuid_hook.c b/kernel/hook/setuid_hook.c
+index d3f3ac49e07f..2c6da789e9b8 100644
+--- a/kernel/hook/setuid_hook.c
++++ b/kernel/hook/setuid_hook.c
+@@ -20,6 +20,7 @@
+ #include "supercall/supercall.h"
+ #include "hook/tp_marker.h"
+ #include "feature/kernel_umount.h"
++#include "feature/mount_hide.h"
+ 
+ int ksu_handle_setresuid(uid_t old_uid, uid_t new_uid)
+ {
+@@ -58,10 +59,12 @@ int ksu_handle_setresuid(uid_t old_uid, uid_t new_uid)
+ void __init ksu_setuid_hook_init(void)
+ {
+     ksu_kernel_umount_init();
++    ksu_mount_hide_init();
+ }
+ 
+ void __exit ksu_setuid_hook_exit(void)
+ {
+     pr_info("ksu_core_exit\n");
+     ksu_kernel_umount_exit();
++    ksu_mount_hide_exit();
+ }
+diff --git a/kernel/policy/allowlist.h b/kernel/policy/allowlist.h
+index bef22f31c9f1..44cf74d46072 100644
+--- a/kernel/policy/allowlist.h
++++ b/kernel/policy/allowlist.h
+@@ -11,6 +11,11 @@
+ #define LAST_APPLICATION_UID 19999
+ #define FIRST_ISOLATED_UID 99000
+ #define LAST_ISOLATED_UID 99999
++// App-zygote isolated processes (e.g. Chrome sandboxed renderers) use a separate
++// range and must be treated as isolated too, otherwise their mount view is neither
++// unmounted nor hidden.
++#define FIRST_APP_ZYGOTE_ISOLATED_UID 90000
++#define LAST_APP_ZYGOTE_ISOLATED_UID 98999
+ 
+ void ksu_allowlist_init(void);
+ 
+@@ -53,6 +58,7 @@ static inline bool is_appuid(uid_t uid)
+ static inline bool is_isolated_process(uid_t uid)
+ {
+     uid_t appid = uid % PER_USER_RANGE;
+-    return appid >= FIRST_ISOLATED_UID && appid <= LAST_ISOLATED_UID;
++    return (appid >= FIRST_ISOLATED_UID && appid <= LAST_ISOLATED_UID) ||
++           (appid >= FIRST_APP_ZYGOTE_ISOLATED_UID && appid <= LAST_APP_ZYGOTE_ISOLATED_UID);
+ }
+ #endif
+diff --git a/manager/app/src/main/cpp/jni.cc b/manager/app/src/main/cpp/jni.cc
+index f4278f98ba46..b16ecf6014bd 100644
+--- a/manager/app/src/main/cpp/jni.cc
++++ b/manager/app/src/main/cpp/jni.cc
+@@ -359,6 +359,18 @@ Java_me_weishu_kernelsu_Natives_setSelinuxHideEnabled(JNIEnv *env, jobject thiz,
+     return set_selinux_hide_enabled(enabled);
+ }
+ 
++extern "C"
++JNIEXPORT jboolean JNICALL
++Java_me_weishu_kernelsu_Natives_isMountHideEnabled(JNIEnv *env, jobject thiz) {
++    return is_mount_hide_enabled();
++}
++
++extern "C"
++JNIEXPORT jint JNICALL
++Java_me_weishu_kernelsu_Natives_setMountHideEnabled(JNIEnv *env, jobject thiz, jboolean enabled) {
++    return set_mount_hide_enabled(enabled);
++}
++
+ extern "C"
+ JNIEXPORT jstring JNICALL
+ Java_me_weishu_kernelsu_Natives_getUserName(JNIEnv *env, jobject thiz, jint uid) {
+diff --git a/manager/app/src/main/cpp/ksu.cc b/manager/app/src/main/cpp/ksu.cc
+index f2148b07b8f2..eb8ddb730198 100644
+--- a/manager/app/src/main/cpp/ksu.cc
++++ b/manager/app/src/main/cpp/ksu.cc
+@@ -234,3 +234,22 @@ bool is_selinux_hide_enabled() {
+     }
+     return value != 0;
+ }
++
++int set_mount_hide_enabled(bool enabled) {
++    if (!set_feature(KSU_FEATURE_MOUNT_HIDE, enabled ? 1 : 0)) {
++        return -errno;
++    }
++    return 0;
++}
++
++bool is_mount_hide_enabled() {
++    uint64_t value = 0;
++    bool supported = false;
++    if (!get_feature(KSU_FEATURE_MOUNT_HIDE, &value, &supported)) {
++        return false;
++    }
++    if (!supported) {
++        return false;
++    }
++    return value != 0;
++}
+diff --git a/manager/app/src/main/cpp/ksu.h b/manager/app/src/main/cpp/ksu.h
+index 011f9e0e746f..86f494cefda1 100644
+--- a/manager/app/src/main/cpp/ksu.h
++++ b/manager/app/src/main/cpp/ksu.h
+@@ -51,6 +51,11 @@ int set_selinux_hide_enabled(bool enabled);
+ 
+ bool is_selinux_hide_enabled();
+ 
++// Mount hide
++int set_mount_hide_enabled(bool enabled);
++
++bool is_mount_hide_enabled();
++
+ bool get_allow_list(struct ksu_new_get_allow_list_cmd *);
+ 
+ inline std::pair<int, int> legacy_get_info() {
+diff --git a/manager/app/src/main/java/me/weishu/kernelsu/Natives.kt b/manager/app/src/main/java/me/weishu/kernelsu/Natives.kt
+index 54daa874bcbb..c08fe3c0beec 100644
+--- a/manager/app/src/main/java/me/weishu/kernelsu/Natives.kt
++++ b/manager/app/src/main/java/me/weishu/kernelsu/Natives.kt
+@@ -89,6 +89,9 @@ object Natives {
+     external fun isSelinuxHideEnabled(): Boolean
+     external fun setSelinuxHideEnabled(enabled: Boolean): Int
+ 
++    external fun isMountHideEnabled(): Boolean
++    external fun setMountHideEnabled(enabled: Boolean): Int
++
+     /**
+      * Get the user name for the uid.
+      */
+diff --git a/manager/app/src/main/java/me/weishu/kernelsu/data/repository/SettingsRepository.kt b/manager/app/src/main/java/me/weishu/kernelsu/data/repository/SettingsRepository.kt
+index 4c53a54ca080..9db25436ceeb 100644
+--- a/manager/app/src/main/java/me/weishu/kernelsu/data/repository/SettingsRepository.kt
++++ b/manager/app/src/main/java/me/weishu/kernelsu/data/repository/SettingsRepository.kt
+@@ -41,6 +41,10 @@ interface SettingsRepository {
+     fun isSelinuxHideEnabled(): Boolean
+     fun setSelinuxHideEnabled(enabled: Boolean): Int
+ 
++    suspend fun getMountHideStatus(): String
++    fun isMountHideEnabled(): Boolean
++    fun setMountHideEnabled(enabled: Boolean): Int
++
+     suspend fun getSulogStatus(): String
+     suspend fun getSulogPersistValue(): Long?
+     fun setSulogEnabled(enabled: Boolean): Boolean
+diff --git a/manager/app/src/main/java/me/weishu/kernelsu/data/repository/SettingsRepositoryImpl.kt b/manager/app/src/main/java/me/weishu/kernelsu/data/repository/SettingsRepositoryImpl.kt
+index 7c6f2121f0c2..3d4e3d40c676 100644
+--- a/manager/app/src/main/java/me/weishu/kernelsu/data/repository/SettingsRepositoryImpl.kt
++++ b/manager/app/src/main/java/me/weishu/kernelsu/data/repository/SettingsRepositoryImpl.kt
+@@ -168,6 +168,12 @@ class SettingsRepositoryImpl : SettingsRepository {
+ 
+     override fun setSelinuxHideEnabled(enabled: Boolean): Int = Natives.setSelinuxHideEnabled(enabled)
+ 
++    override suspend fun getMountHideStatus(): String = getFeatureStatus("mount_hide")
++
++    override fun isMountHideEnabled(): Boolean = Natives.isMountHideEnabled()
++
++    override fun setMountHideEnabled(enabled: Boolean): Int = Natives.setMountHideEnabled(enabled)
++
+     override suspend fun getSulogStatus(): String = getFeatureStatus("sulog")
+ 
+     override suspend fun getSulogPersistValue(): Long? = getFeaturePersistValue("sulog")
+diff --git a/manager/app/src/main/java/me/weishu/kernelsu/ui/screen/settings/SettingsMaterial.kt b/manager/app/src/main/java/me/weishu/kernelsu/ui/screen/settings/SettingsMaterial.kt
+index 00508b60f17d..2a01543b55d9 100644
+--- a/manager/app/src/main/java/me/weishu/kernelsu/ui/screen/settings/SettingsMaterial.kt
++++ b/manager/app/src/main/java/me/weishu/kernelsu/ui/screen/settings/SettingsMaterial.kt
+@@ -225,6 +225,21 @@ fun SettingPagerMaterial(
+                                 onCheckedChange = actions.onSetSelinuxHideEnabled
+                             )
+                         },
++                        {
++                            val mountHideSummary = when (uiState.mountHideStatus) {
++                                "unsupported" -> stringResource(id = R.string.feature_status_unsupported_summary)
++                                "managed" -> stringResource(id = R.string.feature_status_managed_summary)
++                                else -> stringResource(id = R.string.settings_mount_hide_summary)
++                            }
++                            SegmentedSwitchItem(
++                                icon = Icons.Filled.Policy,
++                                title = stringResource(id = R.string.settings_mount_hide),
++                                summary = mountHideSummary,
++                                enabled = uiState.mountHideStatus == "supported",
++                                checked = uiState.isMountHideEnabled,
++                                onCheckedChange = actions.onSetMountHideEnabled
++                            )
++                        },
+                         {
+                             val sulogSummary = when (uiState.sulogStatus) {
+                                 "unsupported" -> stringResource(id = R.string.feature_status_unsupported_summary)
+diff --git a/manager/app/src/main/java/me/weishu/kernelsu/ui/screen/settings/SettingsMiuix.kt b/manager/app/src/main/java/me/weishu/kernelsu/ui/screen/settings/SettingsMiuix.kt
+index a34d31631f91..40fddb7cd56b 100644
+--- a/manager/app/src/main/java/me/weishu/kernelsu/ui/screen/settings/SettingsMiuix.kt
++++ b/manager/app/src/main/java/me/weishu/kernelsu/ui/screen/settings/SettingsMiuix.kt
+@@ -276,6 +276,27 @@ fun SettingPagerMiuix(
+                                 onCheckedChange = actions.onSetSelinuxHideEnabled
+                             )
+ 
++                            val mountHideSummary = when (uiState.mountHideStatus) {
++                                "unsupported" -> stringResource(id = R.string.feature_status_unsupported_summary)
++                                "managed" -> stringResource(id = R.string.feature_status_managed_summary)
++                                else -> stringResource(id = R.string.settings_mount_hide_summary)
++                            }
++                            SwitchPreference(
++                                title = stringResource(id = R.string.settings_mount_hide),
++                                summary = mountHideSummary,
++                                startAction = {
++                                    Icon(
++                                        Icons.Rounded.Policy,
++                                        modifier = Modifier.padding(end = 6.dp),
++                                        contentDescription = stringResource(id = R.string.settings_mount_hide),
++                                        tint = colorScheme.onBackground
++                                    )
++                                },
++                                enabled = uiState.mountHideStatus == "supported",
++                                checked = uiState.isMountHideEnabled,
++                                onCheckedChange = actions.onSetMountHideEnabled
++                            )
++
+                             val sulogSummary = when (uiState.sulogStatus) {
+                                 "unsupported" -> stringResource(id = R.string.feature_status_unsupported_summary)
+                                 "managed" -> stringResource(id = R.string.feature_status_managed_summary)
+diff --git a/manager/app/src/main/java/me/weishu/kernelsu/ui/screen/settings/SettingsScreen.kt b/manager/app/src/main/java/me/weishu/kernelsu/ui/screen/settings/SettingsScreen.kt
+index 1b8d42ebac54..cc76f130c427 100644
+--- a/manager/app/src/main/java/me/weishu/kernelsu/ui/screen/settings/SettingsScreen.kt
++++ b/manager/app/src/main/java/me/weishu/kernelsu/ui/screen/settings/SettingsScreen.kt
+@@ -36,6 +36,7 @@ fun SettingPager(
+         onSetSuCompatMode = viewModel::setSuCompatMode,
+         onSetKernelUmountEnabled = viewModel::setKernelUmountEnabled,
+         onSetSelinuxHideEnabled = viewModel::setSelinuxHideEnabled,
++        onSetMountHideEnabled = viewModel::setMountHideEnabled,
+         onSetSulogEnabled = viewModel::setSulogEnabled,
+         onSetAdbRootEnabled = viewModel::setAdbRootEnabled,
+         onSetDefaultUmountModules = viewModel::setDefaultUmountModules,
+diff --git a/manager/app/src/main/java/me/weishu/kernelsu/ui/screen/settings/SettingsUiState.kt b/manager/app/src/main/java/me/weishu/kernelsu/ui/screen/settings/SettingsUiState.kt
+index f91a9d21f5d1..d9a715bf45b1 100644
+--- a/manager/app/src/main/java/me/weishu/kernelsu/ui/screen/settings/SettingsUiState.kt
++++ b/manager/app/src/main/java/me/weishu/kernelsu/ui/screen/settings/SettingsUiState.kt
+@@ -35,6 +35,8 @@ data class SettingsUiState(
+     // SELinux Hide
+     val selinuxHideStatus: String = "",
+     val isSelinuxHideEnabled: Boolean = false,
++    val mountHideStatus: String = "",
++    val isMountHideEnabled: Boolean = false,
+ 
+     // SU Log
+     val sulogStatus: String = "",
+@@ -64,6 +66,7 @@ data class SettingsScreenActions(
+     val onSetSuCompatMode: (Int) -> Unit,
+     val onSetKernelUmountEnabled: (Boolean) -> Unit,
+     val onSetSelinuxHideEnabled: (Boolean) -> Unit,
++    val onSetMountHideEnabled: (Boolean) -> Unit,
+     val onSetSulogEnabled: (Boolean) -> Unit,
+     val onSetAdbRootEnabled: (Boolean) -> Unit,
+     val onSetDefaultUmountModules: (Boolean) -> Unit,
+diff --git a/manager/app/src/main/java/me/weishu/kernelsu/ui/viewmodel/SettingsViewModel.kt b/manager/app/src/main/java/me/weishu/kernelsu/ui/viewmodel/SettingsViewModel.kt
+index 84bd9dae3caf..39794d5f8f7c 100644
+--- a/manager/app/src/main/java/me/weishu/kernelsu/ui/viewmodel/SettingsViewModel.kt
++++ b/manager/app/src/main/java/me/weishu/kernelsu/ui/viewmodel/SettingsViewModel.kt
+@@ -59,6 +59,8 @@ class SettingsViewModel(
+             val isKernelUmountEnabled = repo.isKernelUmountEnabled()
+             val selinuxHideStatus = repo.getSelinuxHideStatus()
+             val isSelinuxHideEnabled = repo.isSelinuxHideEnabled()
++            val mountHideStatus = repo.getMountHideStatus()
++            val isMountHideEnabled = repo.isMountHideEnabled()
+             val sulogStatus = repo.getSulogStatus()
+             val isSulogEnabled = repo.getSulogPersistValue() == 1L
+             val adbRootStatus = repo.getAdbRootStatus()
+@@ -94,6 +96,8 @@ class SettingsViewModel(
+                     isKernelUmountEnabled = isKernelUmountEnabled,
+                     selinuxHideStatus = selinuxHideStatus,
+                     isSelinuxHideEnabled = isSelinuxHideEnabled,
++                    mountHideStatus = mountHideStatus,
++                    isMountHideEnabled = isMountHideEnabled,
+                     sulogStatus = sulogStatus,
+                     isSulogEnabled = isSulogEnabled,
+                     isDefaultUmountModules = isDefaultUmountModules,
+@@ -284,6 +288,29 @@ class SettingsViewModel(
+         }
+     }
+ 
++    fun setMountHideEnabled(enabled: Boolean) {
++        viewModelScope.launch(Dispatchers.IO) {
++            val status = repo.setMountHideEnabled(enabled)
++            repo.execKsudFeatureSave()
++            _uiState.update { it.copy(isMountHideEnabled = enabled) }
++            when (status) {
++                0 -> {}
++                -OsConstants.EAGAIN -> {
++                    withContext(Dispatchers.Main) {
++                        Toast.makeText(ksuApp, R.string.settings_mount_hide_reboot_required,
++                            Toast.LENGTH_LONG).show()
++                    }
++                }
++                else -> {
++                    withContext(Dispatchers.Main) {
++                        Toast.makeText(ksuApp, ksuApp.getString(R.string.settings_mount_hide_failed, status),
++                            Toast.LENGTH_LONG).show()
++                    }
++                }
++            }
++        }
++    }
++
+     fun setAutoJailbreak(enabled: Boolean) {
+         repo.autoJailbreak = enabled
+         _uiState.update { it.copy(autoJailbreak = enabled) }
+diff --git a/manager/app/src/main/res/values/strings.xml b/manager/app/src/main/res/values/strings.xml
+index a0857f286126..5234f0f363d5 100644
+--- a/manager/app/src/main/res/values/strings.xml
++++ b/manager/app/src/main/res/values/strings.xml
+@@ -193,2 +193,6 @@
+     <string name="settings_selinux_hide_failed">Error: %d</string>
++    <string name="settings_mount_hide">Hide suspicious mounts</string>
++    <string name="settings_mount_hide_summary">Filter KernelSU/module mount records from /proc mount views of isolated and app processes (defeats mount-based root detection).</string>
++    <string name="settings_mount_hide_reboot_required">Reboot to take effect</string>
++    <string name="settings_mount_hide_failed">Error: %d</string>
+     <string name="settings_sulog">SU Log</string>
+diff --git a/uapi/feature.h b/uapi/feature.h
+index df2f68c154d4..44e99db5440e 100644
+--- a/uapi/feature.h
++++ b/uapi/feature.h
+@@ -7,6 +7,7 @@ enum ksu_feature_id {
+     KSU_FEATURE_SULOG = 2,
+     KSU_FEATURE_ADB_ROOT = 3,
+     KSU_FEATURE_SELINUX_HIDE = 4,
++    KSU_FEATURE_MOUNT_HIDE = 5,
+ 
+     KSU_FEATURE_MAX
+ };
+diff --git a/userspace/ksud/src/cli.rs b/userspace/ksud/src/cli.rs
+index f7c743e522e7..273183039f9b 100644
+--- a/userspace/ksud/src/cli.rs
++++ b/userspace/ksud/src/cli.rs
+@@ -411,7 +411,7 @@ enum Profile {
+ enum Feature {
+     /// Get feature value and support status
+     Get {
+-        /// Feature ID or name (su_compat, kernel_umount, sulog, adb_root, selinux_hide)
++        /// Feature ID or name (su_compat, kernel_umount, sulog, adb_root, selinux_hide, mount_hide)
+         id: String,
+         /// Read from config file
+         #[arg(long, default_value_t = false)]
+@@ -431,7 +431,7 @@ enum Feature {
+ 
+     /// Check feature status (supported/unsupported/managed)
+     Check {
+-        /// Feature ID or name (su_compat, kernel_umount, sulog, adb_root, selinux_hide)
++        /// Feature ID or name (su_compat, kernel_umount, sulog, adb_root, selinux_hide, mount_hide)
+         id: String,
+     },
+ 
+diff --git a/userspace/ksud/src/feature.rs b/userspace/ksud/src/feature.rs
+index f64a16f61368..45c2e8e48b87 100644
+--- a/userspace/ksud/src/feature.rs
++++ b/userspace/ksud/src/feature.rs
+@@ -21,6 +21,7 @@ pub enum FeatureId {
+     Sulog = 2,
+     AdbRoot = 3,
+     SelinuxHide = 4,
++    MountHide = 5,
+ }
+ 
+ impl FeatureId {
+@@ -31,6 +32,7 @@ impl FeatureId {
+             2 => Some(Self::Sulog),
+             3 => Some(Self::AdbRoot),
+             4 => Some(Self::SelinuxHide),
++            5 => Some(Self::MountHide),
+             _ => None,
+         }
+     }
+@@ -42,6 +44,7 @@ impl FeatureId {
+             Self::Sulog => "sulog",
+             Self::AdbRoot => "adb_root",
+             Self::SelinuxHide => "selinux_hide",
++            Self::MountHide => "mount_hide",
+         }
+     }
+ 
+@@ -60,6 +63,9 @@ impl FeatureId {
+             Self::SelinuxHide => {
+                 "SELinux Hide - sanitize /sys/fs/selinux access results for app UIDs"
+             }
++            Self::MountHide => {
++                "Mount Hide - filter module mounts from /proc mount views of isolated and app processes"
++            }
+         }
+     }
+ }
+@@ -71,6 +77,7 @@ fn parse_feature_id(name: &str) -> Result<FeatureId> {
+         "sulog" | "2" => Ok(FeatureId::Sulog),
+         "adb_root" | "3" => Ok(FeatureId::AdbRoot),
+         "selinux_hide" | "4" => Ok(FeatureId::SelinuxHide),
++        "mount_hide" | "5" => Ok(FeatureId::MountHide),
+         _ => bail!("Unknown feature: {name}"),
+     }
+ }

@@ -1,103 +1,47 @@
-# Root My Galaxy Payloads
+# Root My Galaxy Payloads — SM-S928B DZF2
 
-This repository contains the device-specific native side of
-[Root My Galaxy](https://github.com/BuSung-dev/Root-My-Galaxy):
+This repository contains only the S928B payload for firmware `S928BXXS6DZF2`
+and kernel `6.1.145-android14-11-33419968-abS928BXXS6DZF2`.
 
-- exact firmware profiles and offsets;
-- the app-domain CVE-2026-43499 exploit source and compiled payload;
-- the app bootstrap helper source;
-- the verified KernelSU late-load build artifacts;
-- the support feed consumed by the application.
+The feed exposes one profile: `e3q-S928BXXS6DZF2`. Root My Galaxy fetches the
+exploit payload and `ksud` from this repository's `support/targets-v3.json`.
+The final exploit, module, and `ksud` payloads stay in the repository; intermediate builds do not. The custom KernelSU Manager APK is a release asset for this target.
 
-It intentionally does not contain Android application source code.
+## S928B artifacts
 
-## Supported payloads
+- Exploit payload: `artifacts/e3q-S928BXXS6DZF2/cve-2026-43499-app.so`
+- KernelSU module: `kernelsu/android14-6.1_kernelsu-e3q-S928BXXS6DZF2-kdp.ko`
+- Late-load binary: `kernelsu/ksud-e3q-S928BXXS6DZF2-kdp`
+- Patch stack: Samsung KDP/RKP/DEFEX, upstream mount-hide commit, and the
+  Samsung SELinux Hide kretprobe fallback.
 
-| Payload | Compatible models | Kernel version | Status |
-| --- | --- | --- | --- |
-| `galaxy-s25-series-2026-06-07` | Galaxy S25, S25+, S25 Edge, and S25 Ultra regional models | `6.6.98` | Device-tested |
-| `e3q-S928USQS6DZF2` | Galaxy S24 Ultra `SM-S928U1` | `6.1.145` | Device-tested |
-| `e3q-S9280ZCS6DZF2` | Galaxy S24 Ultra China `SM-S9280` | `6.1.145` | Device-tested |
-| `e2s-S926BXXUEDZDR` | Galaxy S24+ `SM-S926B` | `6.1.157` | Device-tested |
-| `essi-A566EXXSCCZG6` | Galaxy A56 5G `SM-A566E` | `6.6.102` | Device-tested |
-| `a36xq-A366WVLS3AYG1` | Galaxy A36 5G `SM-A366W` | `6.6.46` | Device-tested |
-| `a53x-A536EXXSNGZG3` | Galaxy A53 5G `SM-A536E` | `5.10.237` | Device-tested |
-| `dm3q-S9180ZHS8FZF5` | Galaxy S23 Ultra `SM-S9180` | `5.15.189` | Test in progress |
-| `q4q-F9360ZCSAIZF1` | Galaxy Z Fold4 `SM-F9360` | `5.10.236` | Device-tested |
-| `dm2q-S916BXXSAFZG1` | Galaxy S23+ `SM-S916B` | `5.15.189` | Experimental: hardware root from ADB shell; not in app feed |
-| `dm3q-S918BXXSAFZF5` | Galaxy S23 Ultra `SM-S918B` | `5.15.189` | Confirmed working: full chain through the app (Shizuku mode) incl. KernelSU late-load and granted `su` |
+Mount hiding and SELinux Hide initialize enabled. Mount hiding filters proc
+mount-table views. It does not hide ordinary files. Root My Galaxy removes its
+staged helper, exploit payload, and `ksud` copies after an install attempt.
+SELinux Hide filters SELinuxFS query/status results; `/proc/self/attr/current`
+writes remain unchanged.
 
-The S916B FZG1 profile is shell-only today. Its exact tracefs route works from `adb shell`, but direct app-domain execution is not supported. Root My Galaxy would need to delegate the native runner through an authorized shell bridge such as Shizuku. See [`artifacts/dm2q-S916BXXSAFZG1/README.md`](artifacts/dm2q-S916BXXSAFZG1/README.md).
-
-The S918B FZF5 profile is hardware-verified through the app's Shizuku mode (exploit, KernelSU late-load, granted `su` under enforcing). Its physical-P0 fallback also engages in unprivileged app-domain execution, but rooting without Shizuku is not yet hardware-confirmed. See [`docs/SM-S918B-S918BXXSAFZF5.md`](docs/SM-S918B-S918BXXSAFZF5.md).
-
-Schema version 3 keeps each exploit and KernelSU artifact once. Its flat
-`models` and `kernelVersions` arrays define runtime compatibility. See
-[`support/README.md`](support/README.md) for the matching rules.
-
-The port is based on the exploit source published at
-<https://github.com/NebuSec/CyberMeowfia/tree/main/IonStack/CVE-2026-43499/exploit>.
-
-## Feed delivery
-
-Root My Galaxy resolves the payload repository's current commit first and
-fetches `support/targets-v3.json` and every artifact from that immutable
-commit. Per-artifact SHA-256 fields and manifest signatures are not part of
-schema version 3. `targets-v2.json` is retained for released 0.2.3 clients.
-
-## Build
+## Build the exploit payload
 
 ```sh
-make TARGET=pa3q-S938NKSUACZF1 ANDROID_NDK_HOME=/path/to/android-ndk
-make TARGET=e3q-S928USQS6DZF2 ANDROID_NDK_HOME=/path/to/android-ndk
-make TARGET=e2s-S926BXXUEDZDR ANDROID_NDK_HOME=/path/to/android-ndk
-make TARGET=essi-S721NKSSCDZF3 ANDROID_NDK_HOME=/path/to/android-ndk
-make TARGET=e1s-S921BXXSFDZF2 ANDROID_NDK_HOME=/path/to/android-ndk
-make TARGET=a15-A155NKSS6BYH1 ANDROID_NDK_HOME=/path/to/android-ndk
-make TARGET=essi-A566EXXSCCZG6 ANDROID_NDK_HOME=/path/to/android-ndk
-make TARGET=a36xq-A366WVLS3AYG1 ANDROID_NDK_HOME=/path/to/android-ndk
-make TARGET=a53x-A536EXXSNGZG3 ANDROID_NDK_HOME=/path/to/android-ndk
-make TARGET=dm3q-S9180ZHS8FZF5 ANDROID_NDK_HOME=/path/to/android-ndk
-make TARGET=q4q-F9360ZCSAIZF1 ANDROID_NDK_HOME=/path/to/android-ndk
-make TARGET=dm2q-S916BXXSAFZG1 ANDROID_NDK_HOME=/path/to/android-ndk
+make TARGET=e3q-S928BXXS6DZF2 ANDROID_NDK_HOME=/path/to/android-ndk stable
 ```
 
-Outputs:
+The release payload is padded to 104,128 bytes. Keep generated `build/` output
+out of the repository; commit only the published S928B payload artifact.
 
-```text
-build/<profile>/cve-2026-43499
-build/<profile>/cve-2026-43499-app.so
-build/<profile>/cve-2026-43499-root
-```
+## KernelSU source and attribution
 
-The release app payload is built with:
+KernelSU v3.2.5 is based on commit
+`b0bc817b4e966aa6aa830834eaf6ef765d821d40`. The mount-hide patch derives from
+[JingMatrix's upstream commit 80a3ab31](https://github.com/JingMatrix/KernelSU/commit/80a3ab31eb108a5515ecaea0f4799a035b7d1ce1).
+The exploit payload is based on
+[NebuSec's CVE-2026-43499 source](https://github.com/NebuSec/CyberMeowfia/tree/main/IonStack/CVE-2026-43499/exploit).
+Root My Galaxy is by [BuSung-dev](https://github.com/BuSung-dev/Root-My-Galaxy).
+See [CREDITS.md](CREDITS.md) for attribution and upstream links.
 
-```sh
-make TARGET=essi-S721NKSSCDZF3 ANDROID_NDK_HOME=/path/to/android-ndk release
-```
+## Documentation
 
-The complete firmware-to-profile procedure is recorded in
-[`docs/PORTING.md`](docs/PORTING.md). Samsung-specific KernelSU changes and
-versioned artifacts are documented in [`kernelsu/README.md`](kernelsu/README.md).
-The exact S921B DZF2 analysis is recorded separately in
-[`docs/SM-S921B-S921BXXSFDZF2.md`](docs/SM-S921B-S921BXXSFDZF2.md), and the
-S928U/S928U1 DZF2 analysis is in
-[`docs/SM-S928U1-S928U1UES6DZF2.md`](docs/SM-S928U1-S928U1UES6DZF2.md). S921B
-is an Exynos 2400 target and is not a Qualcomm/Snapdragon reference for E3Q.
-The 5.10 A15 analysis is in
-[`docs/SM-A155N-A155NKSS6BYH1.md`](docs/SM-A155N-A155NKSS6BYH1.md).
-The SM-A566E CCZG6 analysis and validation record is in
-[`docs/SM-A566E-A566EXXSCCZG6.md`](docs/SM-A566E-A566EXXSCCZG6.md).
-The SM-S926B DZDR analysis and device-validation record is in
-[`docs/SM-S926B-S926BXXUEDZDR.md`](docs/SM-S926B-S926BXXUEDZDR.md).
-The SM-A366W AYG1 device validation is in
-[`docs/SM-A366W-A366WVLS3AYG1.md`](docs/SM-A366W-A366WVLS3AYG1.md).
-The SM-F9360 AIZF1 (5.10, locked-BL, no-LTO clang-12 module) validation is in
-[`docs/SM-F9360-F9360ZCSAIZF1.md`](docs/SM-F9360-F9360ZCSAIZF1.md).
-The experimental SM-S916B FZG1 shell port and its exact hardware evidence are in [`docs/SM-S916B-S916BXXSAFZG1.md`](docs/SM-S916B-S916BXXSAFZG1.md).
-The SM-A536E GZG3 device validation is in
-[`docs/SM-A536E-A536EXXSNGZG3.md`](docs/SM-A536E-A536EXXSNGZG3.md).
-The SM-S9280 China (CHC) DZF2 port and validation record is in
-[`docs/SM-S9280-S9280ZCS6DZF2.md`](docs/SM-S9280-S9280ZCS6DZF2.md).
-
-Use only on devices you own or are explicitly authorized to test.
+- [S928B DZF2 build and validation record](docs/SM-S928B-S928BXXS6DZF2.md)
+- [Reproduce the port](docs/REPRODUCE_PORT.md)
+- [Payload support format](support/README.md)

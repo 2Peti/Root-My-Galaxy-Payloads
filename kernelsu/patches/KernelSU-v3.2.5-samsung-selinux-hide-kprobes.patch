@@ -1,0 +1,433 @@
+diff --git a/kernel/feature/selinux_hide.c b/kernel/feature/selinux_hide.c
+index 5bb59bf..c5c27eb 100644
+--- a/kernel/feature/selinux_hide.c
++++ b/kernel/feature/selinux_hide.c
+@@ -14,6 +14,10 @@
+ #include <net/genetlink.h>
+ #include <linux/moduleparam.h>
+ #include <linux/mutex.h>
++#ifdef CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT
++#include <linux/kprobes.h>
++#include <linux/ptrace.h>
++#endif
+ // security/selinux/include/security.h
+ #include <security.h>
+ #include <ss/context.h>
+@@ -61,6 +65,32 @@ typedef ssize_t (*write_op_fn)(struct file *, char *, size_t);
+ 
+ static write_op_fn *selinux_write_op;
+ 
++#ifdef CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT
++struct ksu_selinux_hide_write_probe_header {
++    struct file *file;
++    char *buf;
++    size_t size;
++    unsigned long ino;
++    bool oversized;
++};
++
++struct ksu_selinux_hide_write_probe_data {
++    struct ksu_selinux_hide_write_probe_header header;
++    /* shortcut: requests beyond the 4 KiB kretprobe-data cap fail closed. */
++    char request[KRETPROBE_MAX_DATA_SIZE - sizeof(struct ksu_selinux_hide_write_probe_header)];
++};
++
++struct ksu_selinux_hide_status_probe_data {
++    struct file *file;
++};
++
++static struct kretprobe selinux_hide_write_probes[2];
++static struct kretprobe selinux_hide_status_probe;
++static unsigned int selinux_hide_write_probe_count;
++static bool selinux_hide_status_probe_registered;
++static struct page *fake_status;
++#endif
++
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+ static int security_context_to_sid_with_policy(struct selinux_policy *policy, const char *scontext, u32 scontext_len,
+                                                u32 *sid, u32 def_sid, gfp_t gfp_flags);
+@@ -78,8 +108,11 @@ static struct selinux_state fake_state;
+ #endif
+ 
+ static write_op_fn *context_write, *access_write;
++#ifndef CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT
+ static write_op_fn orig_context_write, orig_access_write;
++#endif
+ 
++#ifndef CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT
+ static ssize_t my_write_context(struct file *file, char *buf, size_t size)
+ {
+     // apply to all app uids
+@@ -195,7 +228,149 @@ out:
+     kfree(scon);
+     return length;
+ }
++#endif
++
++#ifdef CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT
++/* Kretprobe handlers cannot sleep while checking the saved policy. */
++static int ksu_selinux_hide_context_to_sid(const char *context, size_t length, u32 *sid)
++{
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
++    return security_context_to_sid_with_policy(backup_sepolicy, context, length, sid, SECSID_NULL, GFP_ATOMIC);
++#else
++    return security_context_to_sid(&fake_state, context, length, sid, GFP_ATOMIC);
++#endif
++}
++
++static bool ksu_selinux_hide_space(char c)
++{
++    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
++}
++
++static int ksu_selinux_hide_next_token(char **cursor, char **token)
++{
++    while (ksu_selinux_hide_space(**cursor))
++        (*cursor)++;
++    if (!**cursor)
++        return -EINVAL;
++    *token = *cursor;
++    while (**cursor && !ksu_selinux_hide_space(**cursor))
++        (*cursor)++;
++    if (**cursor)
++        *(*cursor)++ = '\0';
++    return 0;
++}
++
++static int ksu_selinux_hide_access_result(struct ksu_selinux_hide_write_probe_data *data)
++{
++    char *cursor = data->request;
++    char *source, *target, *class_name;
++    u32 source_sid, target_sid;
++    u16 tclass;
++    struct av_decision avd;
++    int ret;
++
++    ret = ksu_selinux_hide_next_token(&cursor, &source);
++    if (ret)
++        return ret;
++    ret = ksu_selinux_hide_next_token(&cursor, &target);
++    if (ret)
++        return ret;
++    ret = ksu_selinux_hide_next_token(&cursor, &class_name);
++    if (ret)
++        return ret;
++    ret = kstrtou16(class_name, 10, &tclass);
++    if (ret)
++        return ret;
++
++    ret = ksu_selinux_hide_context_to_sid(source, strlen(source), &source_sid);
++    if (ret)
++        return ret;
++    ret = ksu_selinux_hide_context_to_sid(target, strlen(target), &target_sid);
++    if (ret)
++        return ret;
++
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
++    if (!security_compute_av_user_with_policy)
++        return -ENOSYS;
++    security_compute_av_user_with_policy(backup_sepolicy, source_sid, target_sid, tclass, &avd);
++#else
++    security_compute_av_user(&fake_state, source_sid, target_sid, tclass, &avd);
++#endif
++
++    return scnprintf(data->header.buf, SIMPLE_TRANSACTION_LIMIT, "%x %x %x %x %u %x", avd.allowed, 0xffffffff,
++                     avd.auditallow, avd.auditdeny, avd.seqno, avd.flags);
++}
++
++static int ksu_selinux_hide_write_probe_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
++{
++    struct ksu_selinux_hide_write_probe_data *data = (struct ksu_selinux_hide_write_probe_data *)ri->data;
++
++    if (!READ_ONCE(ksu_selinux_hide_enabled) || current_uid().val < 10000)
++        return 1;
++
++    data->header.file = (struct file *)(unsigned long)regs->regs[0];
++    data->header.buf = (char *)(unsigned long)regs->regs[1];
++    data->header.size = (size_t)regs->regs[2];
++    if (!data->header.file || !data->header.buf)
++        return 1;
++    data->header.ino = file_inode(data->header.file)->i_ino;
++    if (data->header.ino != SEL_CONTEXT && data->header.ino != SEL_ACCESS)
++        return 1;
++
++    data->header.oversized = data->header.size >= sizeof(data->request);
++    if (!data->header.oversized) {
++        memcpy(data->request, data->header.buf, data->header.size);
++        data->request[data->header.size] = '\0';
++    }
++    return 0;
++}
++
++static int ksu_selinux_hide_write_probe_return(struct kretprobe_instance *ri, struct pt_regs *regs)
++{
++    struct ksu_selinux_hide_write_probe_data *data = (struct ksu_selinux_hide_write_probe_data *)ri->data;
++    ssize_t ret = regs_return_value(regs);
++
++    if (ret < 0 || !data->header.buf)
++        return 0;
++    if (data->header.oversized) {
++        regs->regs[0] = (unsigned long)-E2BIG;
++        return 0;
++    }
++
++    if (data->header.ino == SEL_CONTEXT) {
++        u32 sid;
++        int check = ksu_selinux_hide_context_to_sid(data->request, data->header.size, &sid);
++        if (check)
++            regs->regs[0] = (unsigned long)check;
++    } else if (data->header.ino == SEL_ACCESS) {
++        int check = ksu_selinux_hide_access_result(data);
++        regs->regs[0] = (unsigned long)check;
++    }
++    return 0;
++}
+ 
++static int ksu_selinux_hide_status_probe_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
++{
++    struct ksu_selinux_hide_status_probe_data *data = (struct ksu_selinux_hide_status_probe_data *)ri->data;
++
++    if (!READ_ONCE(ksu_selinux_hide_enabled) || current_uid().val < 10000)
++        return 1;
++    data->file = (struct file *)(unsigned long)regs->regs[1];
++    return data->file ? 0 : 1;
++}
++
++static int ksu_selinux_hide_status_probe_return(struct kretprobe_instance *ri, struct pt_regs *regs)
++{
++    struct ksu_selinux_hide_status_probe_data *data = (struct ksu_selinux_hide_status_probe_data *)ri->data;
++
++    if (!regs_return_value(regs) && data->file && READ_ONCE(fake_status))
++        data->file->private_data = READ_ONCE(fake_status);
++    return 0;
++}
++
++#endif
++
++#ifndef CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT
+ static int my_setprocattr(const char *name, void *value, size_t size);
+ struct ksu_lsm_hook selinux_setprocattr_hook = KSU_LSM_HOOK_INIT(setprocattr, "selinux_setprocattr", my_setprocattr, 0);
+ 
+@@ -241,6 +416,7 @@ static int __nocfi my_setprocattr(const char *name, void *value, size_t size)
+ call_orig:
+     return ((setprocattr_fn)selinux_setprocattr_hook.original)(name, value, size);
+ }
++#endif
+ 
+ static DEFINE_STATIC_KEY_FALSE(fake_status_initialize_key);
+ static struct page *fake_status = NULL;
+@@ -286,6 +462,7 @@ out:
+ }
+ 
+ typedef int (*sel_open_handle_status_fn)(struct inode *inode, struct file *filp);
++#ifndef CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT
+ static sel_open_handle_status_fn orig_sel_open_handle_status, *sel_open_handle_status_slot;
+ static int my_sel_open_handle_status(struct inode *inode, struct file *filp)
+ {
+@@ -306,9 +483,77 @@ static int my_sel_open_handle_status(struct inode *inode, struct file *filp)
+     }
+     return ret;
+ }
++#endif
+ 
++#ifndef CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT
+ static void hook_selinux_status_open();
++#endif
+ static void ksu_selinux_hide_unhook();
++
++#ifdef CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT
++static int ksu_selinux_hide_register_probes(void)
++{
++    const struct file_operations *status_ops;
++    unsigned int i, j;
++    int ret;
++
++    context_write = &selinux_write_op[SEL_CONTEXT];
++    access_write = &selinux_write_op[SEL_ACCESS];
++    if (!*context_write || !*access_write)
++        return -ENOSYS;
++
++    for (i = 0; i < 2; i++) {
++        write_op_fn target = i ? *access_write : *context_write;
++        struct kretprobe *probe;
++        bool duplicate = false;
++
++        for (j = 0; j < selinux_hide_write_probe_count; j++) {
++            if (selinux_hide_write_probes[j].kp.addr == (kprobe_opcode_t *)(unsigned long)target) {
++                duplicate = true;
++                break;
++            }
++        }
++        if (duplicate)
++            continue;
++
++        probe = &selinux_hide_write_probes[selinux_hide_write_probe_count];
++        memset(probe, 0, sizeof(*probe));
++        probe->kp.addr = (kprobe_opcode_t *)(unsigned long)target;
++        probe->entry_handler = ksu_selinux_hide_write_probe_entry;
++        probe->handler = ksu_selinux_hide_write_probe_return;
++        probe->data_size = sizeof(struct ksu_selinux_hide_write_probe_data);
++        probe->maxactive = 64;
++        ret = register_kretprobe(probe);
++        if (ret)
++            goto fail;
++        selinux_hide_write_probe_count++;
++    }
++
++    status_ops = (const struct file_operations *)find_kernel_symbol_exact("sel_handle_status_ops");
++    if (!status_ops || !status_ops->open) {
++        ret = -ENOSYS;
++        goto fail;
++    }
++    memset(&selinux_hide_status_probe, 0, sizeof(selinux_hide_status_probe));
++    selinux_hide_status_probe.kp.addr = (kprobe_opcode_t *)(unsigned long)status_ops->open;
++    selinux_hide_status_probe.entry_handler = ksu_selinux_hide_status_probe_entry;
++    selinux_hide_status_probe.handler = ksu_selinux_hide_status_probe_return;
++    selinux_hide_status_probe.data_size = sizeof(struct ksu_selinux_hide_status_probe_data);
++    selinux_hide_status_probe.maxactive = 64;
++    ret = register_kretprobe(&selinux_hide_status_probe);
++    if (ret)
++        goto fail;
++    selinux_hide_status_probe_registered = true;
++
++    pr_info("selinux_hide: registered Samsung kprobe fallback\n");
++    return 0;
++
++fail:
++    ksu_selinux_hide_unhook();
++    return ret;
++}
++#endif
++
+ static int ksu_selinux_hide_enable()
+ {
+     int ret;
+@@ -322,8 +567,6 @@ static int ksu_selinux_hide_enable()
+         pr_err("selinux_hide: no write_op found!\n");
+         return -ENOSYS;
+     }
+-    hook_selinux_status_open();
+-
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+     security_dump_masked_av_fn = find_kernel_symbol_exact("security_dump_masked_av");
+     if (!security_dump_masked_av_fn) {
+@@ -338,6 +581,17 @@ static int ksu_selinux_hide_enable()
+     fake_state.policy = backup_sepolicy;
+ #endif
+ 
++#ifdef CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT
++    initialize_fake_status();
++    if (!fake_status)
++        return -EAGAIN;
++    ret = ksu_selinux_hide_register_probes();
++    if (ret)
++        goto unhook;
++    return 0;
++#else
++    hook_selinux_status_open();
++
+     context_write = &selinux_write_op[SEL_CONTEXT];
+     pr_info("selinux_hide: context_write: 0x%lx [%pSb]\n", (unsigned long)*context_write, *context_write);
+     write_op_fn my = my_write_context;
+@@ -365,14 +619,24 @@ static int ksu_selinux_hide_enable()
+     }
+ 
+     return 0;
++#endif
+ 
+ unhook:
+     ksu_selinux_hide_unhook();
+-    return -ENOSYS;
++    return ret;
+ }
+ 
+ static void ksu_selinux_hide_unhook()
+ {
++#ifdef CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT
++    /* shortcut: leave setprocattr to SELinux policy unless a timing-safe hook is needed. */
++    if (selinux_hide_status_probe_registered) {
++        unregister_kretprobe(&selinux_hide_status_probe);
++        selinux_hide_status_probe_registered = false;
++    }
++    while (selinux_hide_write_probe_count)
++        unregister_kretprobe(&selinux_hide_write_probes[--selinux_hide_write_probe_count]);
++#else
+     int ret;
+     if (orig_context_write) {
+         ret =
+@@ -398,6 +662,7 @@ static void ksu_selinux_hide_unhook()
+         }
+     }
+     ksu_lsm_unhook(&selinux_setprocattr_hook);
++#endif
+ }
+ 
+ static void ksu_selinux_hide_disable()
+@@ -424,6 +689,8 @@ static int selinux_hide_feature_set(u64 value)
+             ret = ksu_selinux_hide_enable();
+             if (!ret) {
+                 ksu_selinux_hide_running = true;
++            } else {
++                ksu_selinux_hide_enabled = false;
+             }
+         }
+     } else {
+@@ -462,6 +729,7 @@ void ksu_selinux_hide_handle_post_fs_data()
+     }
+ }
+ 
++#ifndef CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT
+ static void hook_selinux_status_open()
+ {
+     if (orig_sel_open_handle_status)
+@@ -483,6 +751,7 @@ static void hook_selinux_status_open()
+         orig_sel_open_handle_status = NULL;
+     }
+ }
++#endif
+ 
+ void __init ksu_selinux_hide_init()
+ {
+@@ -494,7 +763,9 @@ void __init ksu_selinux_hide_init()
+     } else {
+         static_key_enable(&fake_status_initialize_key.key);
+     }
++#ifndef CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT
+     hook_selinux_status_open();
++#endif
+ }
+ 
+ void __exit ksu_selinux_hide_exit()
+
+diff --git a/kernel/feature/selinux_hide.c b/kernel/feature/selinux_hide.c
+--- a/kernel/feature/selinux_hide.c
++++ b/kernel/feature/selinux_hide.c
+@@ -34,7 +34,7 @@
+ #include "hook/lsm_hook.h"
+ 
+ static DEFINE_MUTEX(selinux_hide_mutex);
+-static bool ksu_selinux_hide_enabled __read_mostly = false;
++static bool ksu_selinux_hide_enabled __read_mostly = true;
+ static bool ksu_selinux_hide_running __read_mostly = false;
+ 
+ enum sel_inos {
+@@ -755,6 +755,8 @@
+ 
+ void __init ksu_selinux_hide_init()
+ {
++    int ret;
++
+     if (ksu_register_feature_handler(&selinux_hide_handler)) {
+         pr_err("Failed to register selinux_hide feature handler\n");
+     }
+@@ -766,6 +768,10 @@
+ #ifndef CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT
+     hook_selinux_status_open();
+ #endif
++    ret = selinux_hide_feature_set(1);
++    if (ret) {
++        pr_err("selinux_hide: default enable failed: %d\n", ret);
++    }
+ }
+ 
+ void __exit ksu_selinux_hide_exit()
