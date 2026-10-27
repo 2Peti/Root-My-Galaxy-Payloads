@@ -38,4 +38,4 @@ S928B `vmlinux.elf` audit and hardware revalidation of this default-enabled
 build remain pending. See the [S928B build record](../docs/SM-S928B-S928BXXS6DZF2.md).
 
 The custom Manager APK is attached to the
-[S928B DZF2 release](https://github.com/BuSung-dev/Root-My-Galaxy-Payloads/releases/tag/s928b-dzf2-2026-10-27). Its local signing certificate is accepted as the secondary Manager signer above.
+[S928B DZF2 release](https://github.com/2Peti/Root-My-Galaxy-Payloads/releases/tag/s928b-dzf2-2026-10-27). Its local signing certificate is accepted as the secondary Manager signer above.
